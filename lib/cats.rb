@@ -7,7 +7,7 @@ require 'net/http'
 module Cats
   class Web < Sinatra::Base
     configure do
-      set :url, URI('http://thecatapi.com/api/images/get').freeze
+      set :url, URI('http://thedogapi.com/api/images/get').freeze
     end
 
     get '/' do
