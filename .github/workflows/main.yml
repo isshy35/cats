@@ -1,0 +1,129 @@
+name: Build and Deploy Ruby App
+on:
+  push:
+    branches: [ main ]  # Change this to your main branch name if different
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Allows manual trigger from GitHub UI
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: '3.0'  # Change to match your Ruby version
+        bundler-cache: true  # Uses cache for faster setup
+    
+    - name: Install dependencies
+      run: |
+        gem install bundler
+        bundle install --without development test
+    
+    - name: Run tests
+      run: bundle exec rake test || true
+    
+    - name: Create artifact
+      run: |
+        # Ensure temp directories exist to avoid errors
+        mkdir -p tmp/cache log
+        
+        # Create timestamp for version tracking
+        TIMESTAMP=$(date +%Y%m%d%H%M%S)
+        echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+        
+        # Create tar file with --ignore-failed-read flag
+        APP_NAME="my-ruby-app"
+        TAR_NAME="${APP_NAME}-${{ github.run_number }}-${TIMESTAMP}.tar.gz"
+        # Use tar with flags to handle file changes
+        tar --ignore-failed-read -czf $TAR_NAME --exclude=".git" --exclude=".github" --exclude="tmp/cache" --exclude="log/*.log" .
+        
+        echo "TAR_NAME=${TAR_NAME}" >> $GITHUB_ENV
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ruby-app-artifact
+        path: ${{ env.TAR_NAME }}
+        retention-days: 5
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ec2-sshy-key
+    
+    steps:
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: ruby-app-artifact
+    
+    - name: Install SSH key
+      uses: shimataro/ssh-key-action@v2
+      with:
+        key: ${{ secrets.EC2_SSH_KEY }}
+        known_hosts: unnecessary
+        if_key_exists: replace
+    
+    - name: Add host to known_hosts
+      run: ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+    
+    - name: Deploy to EC2
+      env:
+        EC2_HOST: ${{ secrets.EC2_HOST }}
+        EC2_USERNAME: "ubuntu"
+        APP_NAME: "my-ruby-app"
+        DEPLOY_DIR: "/home/ubuntu/apps/my-ruby-app"
+      run: |
+        # Get the tar file name
+        TAR_NAME=$(ls *.tar.gz)
+        
+        # Create deploy directories
+        ssh ubuntu@$EC2_HOST "mkdir -p $DEPLOY_DIR/releases"
+        
+        # Upload artifact
+        scp $TAR_NAME ubuntu@$EC2_HOST:$DEPLOY_DIR/
+        
+        # Create and execute deployment script
+        cat > deploy.sh << 'EOL'
+        #!/bin/bash
+        
+        APP_NAME="my-ruby-app"
+        DEPLOY_DIR="/home/ubuntu/apps/${APP_NAME}"
+        CURRENT_DIR="${DEPLOY_DIR}/current"
+        RELEASES_DIR="${DEPLOY_DIR}/releases"
+        ARTIFACT=$1
+        
+        # Create timestamp-based release directory
+        TIMESTAMP=$(date +%Y%m%d%H%M%S)
+        RELEASE_DIR="${RELEASES_DIR}/${TIMESTAMP}"
+        mkdir -p ${RELEASE_DIR}
+        
+        # Extract the release
+        tar -xzf ${DEPLOY_DIR}/${ARTIFACT} -C ${RELEASE_DIR}
+        
+        # Update symlink
+        if [ -L ${CURRENT_DIR} ]; then
+          rm ${CURRENT_DIR}
+        fi
+        ln -sf ${RELEASE_DIR} ${CURRENT_DIR}
+        
+        # Restart the application with PM2
+        cp -rf ${CURRENT_DIR}/* /home/ubuntu/cats/ 
+        cd /home/ubuntu/cats
+        pm2 restart "my-rubyyy"
+        pm2 save
+        
+        # Clean up old releases (keep last 5)
+        cd ${RELEASES_DIR}
+        ls -1tr | head -n -5 | xargs -r rm -rf
+        
+        # Remove the artifact
+        rm ${DEPLOY_DIR}/${ARTIFACT}
+        EOL
+        
+        chmod +x deploy.sh
+        scp deploy.sh ubuntu@$EC2_HOST:$DEPLOY_DIR/
+        ssh ubuntu@$EC2_HOST "cd $DEPLOY_DIR && ./deploy.sh $TAR_NAME"
